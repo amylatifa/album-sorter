@@ -1,0 +1,6 @@
+{
+  "name": "album-sorter-api",
+  "main": "dist/server/index.js",
+  "compatibility_date": "2026-11-18",
+  "workers_dev": true
+}

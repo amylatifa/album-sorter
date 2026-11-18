@@ -3,33 +3,46 @@ import test from 'node:test';
 
 import { searchAllSources } from '../src/catalog.ts';
 
-test('a search merges both catalogs and shows duplicate albums only once', async () => {
+test('React requests the combined catalog API and displays results', async () => {
   const previousFetch = globalThis.fetch;
   const previousWindow = globalThis.window;
-  const requestedHosts = [];
+  const requestedUrls = [];
 
   try {
     globalThis.window = { location: { origin: 'https://album-sorter.example' } };
     globalThis.fetch = async (input) => {
       const url = new URL(input);
-      requestedHosts.push(url.host);
-      if (url.host === 'itunes.apple.com') {
-        return Response.json({ results: [{
-          collectionId: 1710637196,
-          collectionName: 'Heaven Knows',
-          artistName: 'PinkPantheress',
-          artworkUrl100: 'https://example.test/100x100bb.jpg',
-          releaseDate: '2023-11-10T00:00:00Z',
-        }] });
-      }
-      if (url.pathname === '/api/musicbrainz') {
-        return Response.json({ 'release-groups': [
-          { id: 'ee2d901b-5a23-4d45-82ce-4e245a5a3ac1', title: 'heaven knows', 'primary-type': 'Album', 'artist-credit': [{ name: 'PinkPantheress' }] },
-          { id: 'an-extra-test-album', title: 'Rare Catalog Album', 'primary-type': 'Album', 'artist-credit': [{ name: 'Test Artist' }] },
-        ] });
-      }
-      throw new Error(`Unexpected request: ${url}`);
-    };
+      requestedUrls.push(url);
+
+      // Check that React requests the combined catalog API
+      assert.equal(url.pathname, '/api/search');
+
+      assert.equal(
+        url.searchParams.get('term'),
+        'Heaven Knows PinkPantheress'
+      );
+
+      // Simulate the combined results returned by Cloudflare
+      return Response.json({
+        albums: [
+          {
+            id: 1710637196,
+            title: 'Heaven Knows',
+            artist: 'PinkPantheress',
+            artwork: 'https://example.test/600x600bb.jpg',
+            source: 'itunes',
+          },
+          {
+            id: 'musicbrainz:rare',
+            title: 'Rare Catalog Album',
+            artist: 'Test Artist',
+            artwork: '',
+            source: 'musicbrainz',
+          },
+        ],
+        failedSources: [],
+  });
+};
 
     const result = await searchAllSources('Heaven Knows PinkPantheress');
     assert.deepEqual(result.failedSources, []);
@@ -38,11 +51,14 @@ test('a search merges both catalogs and shows duplicate albums only once', async
     assert.equal(result.albums[0].title, 'Heaven Knows');
     assert.equal(result.albums[0].source, 'itunes');
     assert.ok(result.albums.some((album) => album.title === 'Rare Catalog Album'));
-    assert.ok(requestedHosts.includes('itunes.apple.com'));
-    assert.ok(requestedHosts.includes('album-sorter.example'));
-  } finally {
-    globalThis.fetch = previousFetch;
-    if (previousWindow === undefined) delete globalThis.window;
-    else globalThis.window = previousWindow;
-  }
+    assert.equal(requestedUrls.length, 1);
+    assert.equal(
+      requestedUrls[0].origin,
+      'https://album-sorter.example'
+    );
+      } finally {
+        globalThis.fetch = previousFetch;
+        if (previousWindow === undefined) delete globalThis.window;
+        else globalThis.window = previousWindow;
+      }
 });
