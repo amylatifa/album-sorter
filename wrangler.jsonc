@@ -1,6 +1,12 @@
 {
-  "name": "album-sorter-api",
-  "main": "dist/server/index.js",
-  "compatibility_date": "2026-11-18",
-  "workers_dev": true
+	"name": "album-sorter-api",
+	"main": "dist/server/index.js",
+	"compatibility_date": "2026-11-18",
+	"workers_dev": true,
+	"kv_namespaces": [
+		{
+			"binding": "CATALOG_CACHE",
+			"id": "ada17ef963954a3eb5ccc59bb1a625e8"
+		}
+	]
 }

@@ -6,6 +6,13 @@ const ALLOWED_ORIGINS = new Set([
   'http://localhost:5173',
   'http://127.0.0.1:5173',
 ]);
+const CACHE_PREFIX = 'albums:v2:';
+const CACHE_FRESH_MS = 12 * 60 * 60 * 1000;
+const CACHE_PARTIAL_FRESH_MS = 60 * 1000;
+const CACHE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+
+let itunesCooldownUntil = 0;
+let musicBrainzCooldownUntil = 0;
 let lastUpstreamRequestAt = 0;
 let upstreamQueue = Promise.resolve();
 
@@ -47,28 +54,84 @@ function waitForUpstreamTurn(action) {
   upstreamQueue = request.then(() => undefined, () => undefined);
   return request;
 }
+function retryDelay(response, fallbackMs) {
+  const header = response.headers.get('Retry-After');
+
+  if (!header) return fallbackMs;
+
+  const seconds = Number(header);
+
+  const ms = Number.isFinite(seconds) && seconds >= 0
+    ? seconds * 1000
+    : Date.parse(header) - Date.now();
+
+  return Number.isFinite(ms)
+    ? Math.min(
+        10 * 60 * 1000,
+        Math.max(fallbackMs, ms)
+      )
+    : fallbackMs;
+}
+
+// Only cache successful upstream responses
+const upstreamCache = {
+  cacheEverything: true,
+  cacheTtlByStatus: {
+    '200-299': 60 * 60,
+    '400-599': 0,
+  },
+};
 
 async function fetchMusicBrainz(query) {
-  const upstreamUrl = new URL('https://musicbrainz.org/ws/2/release-group/');
+  // Don't make another request during a cooldown
+  if (Date.now() < musicBrainzCooldownUntil) {
+    throw new Error(
+      'MusicBrainz cooling down after a rate-limit response'
+    );
+  }
+
+  const upstreamUrl = new URL(
+    'https://musicbrainz.org/ws/2/release-group/'
+  );
+
   upstreamUrl.searchParams.set('query', query);
   upstreamUrl.searchParams.set('fmt', 'json');
   upstreamUrl.searchParams.set('limit', '18');
 
-  const upstream = await waitForUpstreamTurn(() =>
-    fetch(upstreamUrl, {
+  const upstream = await waitForUpstreamTurn(() => {
+    if (Date.now() < musicBrainzCooldownUntil) {
+      throw new Error(
+        'MusicBrainz cooling down after a rate-limit response'
+      );
+    }
+
+    return fetch(upstreamUrl, {
       headers: {
         'User-Agent': CLIENT_USER_AGENT,
         Accept: 'application/json',
       },
-    })
-  );
+      cf: upstreamCache,
+    });
+  });
+
+  // Handle rate limits and temporary unavailability
+  if (
+    upstream.status === 429 ||
+    upstream.status === 503
+  ) {
+    musicBrainzCooldownUntil =
+      Date.now() + retryDelay(upstream, 30 * 1000);
+  }
 
   if (!upstream.ok) {
-    throw new Error('MusicBrainz returned ' + upstream.status);
+    throw new Error(
+      'MusicBrainz returned ' + upstream.status
+    );
   }
 
   return upstream.json();
 }
+
 function normalizeText(text) {
   return text
     .normalize('NFKD')
@@ -134,7 +197,88 @@ function deduplicateAlbums(albums) {
     return true;
   });
 }
-  async function fetchItunesAlbums(term) {
+async function cacheKey(term) {
+  const normalized = term
+    .normalize('NFKC')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ');
+
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(normalized)
+  );
+
+  const hex = Array.from(
+    new Uint8Array(digest),
+    (byte) => byte.toString(16).padStart(2, '0')
+  ).join('');
+
+  return CACHE_PREFIX + hex;
+}
+async function readCachedCatalog(env, term) {
+  if (!env?.CATALOG_CACHE) {
+    return null;
+  }
+
+  try {
+    const entry = await env.CATALOG_CACHE.get(
+      await cacheKey(term),
+      'json'
+    );
+
+    if (
+      !entry ||
+      !Array.isArray(entry.albums) ||
+      !Number.isFinite(entry.savedAt)
+    ) {
+      return null;
+    }
+
+    return entry;
+
+  } catch (error) {
+    console.error('Catalog cache read failed:', error);
+    return null;
+  }
+}
+
+async function saveCachedCatalog(
+  env,
+  term,
+  albums,
+  complete
+) {
+  if (!env?.CATALOG_CACHE) {
+    return;
+  }
+
+  try {
+    await env.CATALOG_CACHE.put(
+      await cacheKey(term),
+
+      JSON.stringify({
+        albums,
+        complete,
+        savedAt: Date.now(),
+      }),
+
+      {
+        expirationTtl: CACHE_RETENTION_SECONDS,
+      }
+    );
+
+  } catch (error) {
+    console.error('Catalog cache write failed:', error);
+  }
+}
+
+async function fetchItunesAlbums(term) {
+  if (Date.now() < itunesCooldownUntil) {
+      throw new Error(
+        'iTunes cooling down after a rate-limit response'
+      );
+    }
   const url = new URL('https://itunes.apple.com/search');
 
   url.searchParams.set('term', term);
@@ -143,8 +287,16 @@ function deduplicateAlbums(albums) {
   url.searchParams.set('country', 'US');
   url.searchParams.set('limit', '25');
 
-  const response = await fetch(url);
-
+  const response = await fetch(url, {
+    cf: upstreamCache, 
+  });
+  if (
+    response.status === 429 ||
+    response.status === 503
+  ) {
+    itunesCooldownUntil =
+      Date.now() + retryDelay(response, 2 * 60 * 1000);
+  }
   if (!response.ok) {
     throw new Error('iTunes returned ' + response.status);
   }
@@ -220,7 +372,7 @@ async function fetchMusicBrainzAlbums(term) {
   });
 }
 
-async function searchAllAlbums(request) {
+async function searchAllAlbums(request, env) {
   const term = (
     new URL(request.url).searchParams.get('term') ?? ''
   ).trim();
@@ -233,6 +385,23 @@ async function searchAllAlbums(request) {
     );
   }
 
+  // Check for previously saved albums
+  const saved = await readCachedCatalog(env, term);
+
+  const freshFor = saved?.complete
+    ? CACHE_FRESH_MS
+    : CACHE_PARTIAL_FRESH_MS;
+
+  // Return fresh cached results without contacting either API
+  if (saved && Date.now() - saved.savedAt < freshFor) {
+    return encodeResponse(request, {
+      albums: saved.albums,
+      failedSources: [],
+      cached: true,
+    });
+  }
+
+  // Search both catalogs
   const [itunes, musicbrainz] = await Promise.allSettled([
     fetchItunesAlbums(term),
     fetchMusicBrainzAlbums(term),
@@ -246,10 +415,27 @@ async function searchAllAlbums(request) {
   }
 
   if (musicbrainz.status === 'rejected') {
+    console.error(
+      'MusicBrainz search failed:',
+      musicbrainz.reason
+    );
+
     failedSources.push('musicbrainz');
   }
 
+  // Both APIs failed
   if (failedSources.length === 2) {
+
+    // Return previously cached albums if available
+    if (saved?.albums.length) {
+      return encodeResponse(request, {
+        albums: saved.albums,
+        failedSources,
+        cached: true,
+        stale: true,
+      });
+    }
+
     return encodeResponse(
       request,
       {
@@ -260,16 +446,43 @@ async function searchAllAlbums(request) {
     );
   }
 
+  // Combine current results with older results when needed
   const albums = [
-    ...(itunes.status === 'fulfilled' ? itunes.value : []),
-    ...(musicbrainz.status === 'fulfilled' ? musicbrainz.value : []),
+    ...(itunes.status === 'fulfilled'
+      ? itunes.value
+      : []),
+
+    ...(musicbrainz.status === 'fulfilled'
+      ? musicbrainz.value
+      : []),
+
+    ...(failedSources.length && saved
+      ? saved.albums
+      : []),
   ];
 
-  albums.sort((a, b) => matchScore(b, term) - matchScore(a, term));
+  // Sort results by relevance
+  albums.sort(
+    (a, b) => matchScore(b, term) - matchScore(a, term)
+  );
+
+  // Remove duplicate albums
+  const merged = deduplicateAlbums(albums);
+
+  // Save successful results
+  if (failedSources.length === 0 || !saved) {
+    await saveCachedCatalog(
+      env,
+      term,
+      merged,
+      failedSources.length === 0
+    );
+  }
 
   return encodeResponse(request, {
-    albums: deduplicateAlbums(albums),
+    albums: merged,
     failedSources,
+    cached: Boolean(saved && failedSources.length),
   });
 }
 
@@ -318,7 +531,7 @@ function serveAsset(assetPath) {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (
@@ -355,7 +568,7 @@ export default {
 
       // Combined iTunes + MusicBrainz search
       if (url.pathname === '/api/search') {
-        return searchAllAlbums(request);
+        return searchAllAlbums(request, env);
       }
 
       return musicBrainzSearch(request);
